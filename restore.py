@@ -5,6 +5,7 @@
     python restore.py <备份目录>
 
 若未提供备份目录，将在 PyWebIO 页面要求用户输入。
+若目标设备未 root，会在页面给出警告，并自动禁用需要 root 的恢复项。
 """
 
 from __future__ import annotations
@@ -15,13 +16,18 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pywebio import start_server
 from pywebio.output import put_markdown, put_text
 
 from android_backup import adb, apps, ui, wifi
 
+# 每个备份项是否需要 root 才能恢复
+ITEM_REQUIRES_ROOT: Dict[str, bool] = {
+    wifi.ITEM["id"]: True,
+    apps.ITEM["id"]: True,
+}
 BACKEND_BY_ID = {wifi.ITEM["id"]: wifi, apps.ITEM["id"]: apps}
 
 logger = logging.getLogger("android_backup.restore")
@@ -52,7 +58,7 @@ def _make_app(initial_dir: Optional[str]):
 
 def _run(initial_dir: Optional[str]) -> None:
     put_markdown("# Android 恢复工具")
-    put_markdown("> 假定设备已 root；启动后会自动执行 `adb root` 与设备就绪检查。")
+    put_markdown("> 启动后会自动检查设备连接并尝试 `adb root`；若设备未 root，部分功能将被禁用。")
 
     # 1) 获取备份目录
     backup_dir_str = initial_dir or ui.ask_path("请输入备份目录路径")
@@ -65,6 +71,9 @@ def _run(initial_dir: Optional[str]) -> None:
     put_text(f"备份目录: {backup_dir}")
     put_text(f"备份创建时间: {manifest.get('created_at', '?')}")
     put_text(f"原设备 serial: {manifest.get('device_serial', '?')}")
+    backup_has_root = bool(manifest.get("has_root", True))
+    if not backup_has_root:
+        logger.info("本次备份是在无 root 环境下创建的")
 
     items = manifest.get("items", [])
     # 仅保留当前版本支持的 backend
@@ -73,31 +82,67 @@ def _run(initial_dir: Optional[str]) -> None:
         ui.show_error("manifest.json 中没有当前工具支持恢复的项")
         return
 
-    # 2) 设备检查
+    # 2) 设备连通性检查（不要求 root，失败直接退出）
     try:
-        serial = adb.ensure_root_device()
+        serial = adb.ensure_device()
     except Exception as exc:  # noqa: BLE001
         ui.show_error(str(exc))
         return
     put_text(f"目标设备: {serial}")
 
-    # 3) 选择恢复范围
-    selected: List[str] = ui.select_items(supported, title="选择要恢复的数据范围")
+    # 3) 尝试提权 + 检查真实 root 权限（失败不退出，降级为无 root 模式）
+    adb.try_adb_root()
+    has_root = adb.has_root_access()
+    if has_root:
+        logger.info("已确认具备 root 权限")
+    else:
+        logger.warning("adb shell 不具备 root 权限，将禁用需要 root 的恢复项")
+        ui.show_warning(
+            "未检测到 root 权限：应用数据恢复、WiFi 配置恢复均需要写入设备内部私有目录"
+            "（/data/data、/data/misc 等），已自动禁用上述恢复项。请先对设备进行 root"
+            " 解锁后再使用完整功能。"
+        )
+
+    # 4) 构造勾选列表：需要 root 但无权限的项标记为 disabled
+    selectable_items: List[Dict[str, Any]] = []
+    for it in supported:
+        item_id = it["id"]
+        entry: Dict[str, Any] = {
+            "id": item_id,
+            "label": it.get("label") or item_id,
+        }
+        if ITEM_REQUIRES_ROOT.get(item_id, False) and not has_root:
+            entry["disabled"] = True
+            entry["label"] = (it.get("label") or item_id) + "  （需要 root 权限）"
+        selectable_items.append(entry)
+
+    # 5) 选择恢复范围
+    selected: List[str] = ui.select_items(
+        selectable_items, title="选择要恢复的数据范围"
+    )
+    # 再次过滤：防止 PyWebIO 旧版本下 disabled 项仍可能被返回
+    selected = [
+        sid for sid in selected
+        if not (ITEM_REQUIRES_ROOT.get(sid, False) and not has_root)
+    ]
     if not selected:
-        ui.show_error("未选择任何恢复项，已取消")
+        if has_root:
+            ui.show_error("未选择任何恢复项，已取消")
+        else:
+            ui.show_error("未选择任何恢复项（可能是未 root 导致所有项被禁用），已取消")
         return
 
-    # 4) 执行恢复
+    # 6) 执行恢复
     rows = []
     for item_id in selected:
         item = next(it for it in supported if it["id"] == item_id)
         backend = BACKEND_BY_ID[item_id]
         try:
             backend.restore(backup_dir)
-            rows.append([item["label"], "✅ 成功", "完成"])
+            rows.append([item.get("label") or item_id, "✅ 成功", "完成"])
         except Exception as exc:  # noqa: BLE001
             logger.exception("恢复 %s 失败", item_id)
-            rows.append([item["label"], "❌ 失败", str(exc)])
+            rows.append([item.get("label") or item_id, "❌ 失败", str(exc)])
 
     ui.show_result("恢复结果", rows)
     if any(it == "wifi" for it in selected):

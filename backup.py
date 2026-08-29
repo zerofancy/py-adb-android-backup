@@ -2,7 +2,8 @@
 """Android 备份入口。
 
 通过 PyWebIO 让用户勾选要备份的数据范围，并将选中的数据备份到当前目录下
-以操作时间命名的子目录中。第一版仅支持 WiFi 密码。
+以操作时间命名的子目录中。若设备未 root，会在页面给出警告，并自动禁用
+需要 root 的备份项（应用数据、WiFi 密码）。
 """
 
 from __future__ import annotations
@@ -13,15 +14,18 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
 from pywebio import start_server
 from pywebio.output import put_markdown, put_text
 
 from android_backup import adb, apps, ui, wifi
 
-# 注册支持的备份项
-SUPPORTED_ITEMS = [wifi.ITEM, apps.ITEM]
+# 注册支持的备份项（附带 requires_root 标记，用于无 root 时禁用）
+SUPPORTED_ITEMS: List[Dict[str, Any]] = [
+    {**wifi.ITEM, "requires_root": True},
+    {**apps.ITEM, "requires_root": True},
+]
 ITEM_BY_ID = {it["id"]: it for it in SUPPORTED_ITEMS}
 BACKEND_BY_ID = {wifi.ITEM["id"]: wifi, apps.ITEM["id"]: apps}
 
@@ -45,28 +49,63 @@ def main_app() -> None:
 
 def _run() -> None:
     put_markdown("# Android 备份工具")
-    put_markdown("> 假定设备已 root；启动后会自动执行 `adb root` 与设备就绪检查。")
+    put_markdown("> 启动后会自动检查设备连接并尝试 `adb root`；若设备未 root，部分功能将被禁用。")
 
-    # 1) 设备检查
+    # 1) 设备连通性检查（不要求 root，失败直接退出）
     try:
-        serial = adb.ensure_root_device()
+        serial = adb.ensure_device()
     except Exception as exc:  # noqa: BLE001
         ui.show_error(str(exc))
         return
-    put_text(f"设备就绪: {serial}")
+    put_text(f"设备已连接: {serial}")
 
-    # 2) 选择备份范围
-    selected: List[str] = ui.select_items(SUPPORTED_ITEMS, title="选择要备份的数据范围")
+    # 2) 尝试提权 + 检查真实 root 权限（失败不退出，降级为无 root 模式）
+    adb.try_adb_root()
+    has_root = adb.has_root_access()
+    if has_root:
+        logger.info("已确认具备 root 权限")
+    else:
+        logger.warning("adb shell 不具备 root 权限，将禁用需要 root 的备份项")
+        ui.show_warning(
+            "未检测到 root 权限：应用数据备份、WiFi 配置备份均需要访问设备内部私有目录"
+            "（/data/data、/data/misc 等），已自动禁用上述备份项。请先对设备进行 root"
+            " 解锁后再使用完整功能。"
+        )
+
+    # 3) 构造勾选列表：需要 root 但无权限的项标记为 disabled
+    selectable_items: List[Dict[str, Any]] = []
+    for it in SUPPORTED_ITEMS:
+        entry: Dict[str, Any] = {
+            "id": it["id"],
+            "label": it["label"],
+        }
+        if it.get("requires_root") and not has_root:
+            entry["disabled"] = True
+            entry["label"] = it["label"] + "  （需要 root 权限）"
+        selectable_items.append(entry)
+
+    # 4) 选择备份范围
+    selected: List[str] = ui.select_items(
+        selectable_items, title="选择要备份的数据范围"
+    )
+    # 再次过滤：防止 PyWebIO 在旧版本下仍可能返回 disabled 项的值
+    selected = [
+        sid for sid in selected
+        if not (ITEM_BY_ID[sid].get("requires_root") and not has_root)
+    ]
     if not selected:
-        ui.show_error("未选择任何备份项，已取消")
+        if has_root:
+            ui.show_error("未选择任何备份项，已取消")
+        else:
+            ui.show_error("未选择任何备份项（可能是未 root 导致所有项被禁用），已取消")
         return
 
-    # 3) 创建备份目录
+    # 5) 创建备份目录
     backup_dir = _new_backup_dir()
     logger.info("创建备份目录: %s", backup_dir)
     put_text(f"备份目录: {backup_dir}")
 
-    # 4) 执行备份
+    # 6) 执行备份
     rows = []
     items_meta = []
     for item_id in selected:
@@ -84,10 +123,11 @@ def _run() -> None:
             logger.exception("备份 %s 失败", item_id)
             rows.append([item["label"], "❌ 失败", str(exc)])
 
-    # 5) 写入 manifest.json
+    # 7) 写入 manifest.json
     manifest = {
         "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
         "device_serial": serial,
+        "has_root": has_root,
         "items": items_meta,
     }
     manifest_path = backup_dir / "manifest.json"
