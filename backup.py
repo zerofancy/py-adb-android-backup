@@ -3,7 +3,13 @@
 
 通过 PyWebIO 让用户勾选要备份的数据范围，并将选中的数据备份到当前目录下
 以操作时间命名的子目录中。若设备未 root，会在页面给出警告，并自动禁用
-需要 root 的备份项（应用数据、WiFi 密码）。
+需要 root 的备份项（应用、联系人、短信）。
+
+支持的备份项：
+  - 相册 (photos)：照片与视频，无需 root
+  - 联系人 (contacts)：需要 root
+  - 短信与彩信 (sms)：需要 root
+  - 应用与应用数据 (apps)：需要 root
 """
 
 from __future__ import annotations
@@ -19,15 +25,23 @@ from typing import Any, Dict, List
 from pywebio import start_server
 from pywebio.output import put_markdown, put_text
 
-from android_backup import adb, apps, ui, wifi
+from android_backup import adb, apps, contacts, photos, sms, ui
 
 # 注册支持的备份项（附带 requires_root 标记，用于无 root 时禁用）
+# 注意：相册无需 root，其它三项（应用/联系人/短信）都需要访问系统私有目录。
 SUPPORTED_ITEMS: List[Dict[str, Any]] = [
-    {**wifi.ITEM, "requires_root": True},
-    {**apps.ITEM, "requires_root": True},
+    {**photos.ITEM,   "requires_root": False},
+    {**contacts.ITEM, "requires_root": True},
+    {**sms.ITEM,      "requires_root": True},
+    {**apps.ITEM,     "requires_root": True},
 ]
 ITEM_BY_ID = {it["id"]: it for it in SUPPORTED_ITEMS}
-BACKEND_BY_ID = {wifi.ITEM["id"]: wifi, apps.ITEM["id"]: apps}
+BACKEND_BY_ID = {
+    photos.ITEM["id"]:   photos,
+    contacts.ITEM["id"]: contacts,
+    sms.ITEM["id"]:      sms,
+    apps.ITEM["id"]:     apps,
+}
 
 logger = logging.getLogger("android_backup.backup")
 
@@ -49,7 +63,8 @@ def main_app() -> None:
 
 def _run() -> None:
     put_markdown("# Android 备份工具")
-    put_markdown("> 启动后会自动检查设备连接并尝试 `adb root`；若设备未 root，部分功能将被禁用。")
+    put_markdown("> 启动后会自动检查设备连接并尝试 `adb root`；若设备未 root，"
+                 "应用/联系人/短信 等需要 root 的项将被禁用，相册仍可用。")
 
     # 1) 设备连通性检查（不要求 root，失败直接退出）
     try:
@@ -67,9 +82,9 @@ def _run() -> None:
     else:
         logger.warning("adb shell 不具备 root 权限，将禁用需要 root 的备份项")
         ui.show_warning(
-            "未检测到 root 权限：应用数据备份、WiFi 配置备份均需要访问设备内部私有目录"
-            "（/data/data、/data/misc 等），已自动禁用上述备份项。请先对设备进行 root"
-            " 解锁后再使用完整功能。"
+            "未检测到 root 权限：应用、联系人、短信的备份需要访问系统私有目录"
+            "（/data/data 等），已自动禁用上述备份项。相册（无需 root）仍可勾选使用。"
+            "请先对设备进行 root 解锁后再使用完整功能。"
         )
 
     # 3) 构造勾选列表：需要 root 但无权限的项标记为 disabled
@@ -105,23 +120,32 @@ def _run() -> None:
     logger.info("创建备份目录: %s", backup_dir)
     put_text(f"备份目录: {backup_dir}")
 
-    # 6) 执行备份
+    # 6) 执行备份 —— 接入实时进度框架，每项开始/结束都在网页上追加输出
+    ui.begin_progress_section("备份执行进度")
     rows = []
     items_meta = []
     for item_id in selected:
         item = ITEM_BY_ID[item_id]
         backend = BACKEND_BY_ID[item_id]
+        ui.progress_start(item["label"])
         try:
-            backend.backup(backup_dir)
-            rows.append([item["label"], "✅ 成功", ", ".join(item["files"])])
+            result = backend.backup(backup_dir)
+            if result is False:
+                rows.append([item["label"], "⏭️ 已跳过", "未选择可备份内容"])
+                ui.progress_done(item["label"], True, "已跳过")
+                continue
+            detail = ", ".join(item["files"])
+            rows.append([item["label"], "✅ 成功", detail])
             items_meta.append({
                 "id": item_id,
                 "label": item["label"],
                 "files": item["files"],
             })
+            ui.progress_done(item["label"], True, detail)
         except Exception as exc:  # noqa: BLE001
             logger.exception("备份 %s 失败", item_id)
             rows.append([item["label"], "❌ 失败", str(exc)])
+            ui.progress_done(item["label"], False, str(exc))
 
     # 7) 写入 manifest.json
     manifest = {

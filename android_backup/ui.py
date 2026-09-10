@@ -8,9 +8,11 @@ from typing import Any, Iterable, List, Mapping
 
 from pywebio.input import checkbox, input as web_input
 from pywebio.output import put_markdown, put_table, put_text
-from pywebio.output import Output, popup, put_html, use_scope
+from pywebio.output import Output, popup, put_html, put_scrollable, use_scope
 
 _LOG_INITIALIZED = False
+_PROGRESS_SCOPE = "progress_stream"
+_PROGRESS_INNER_SCOPE = "progress_stream_inner"
 
 
 def setup_logging() -> None:
@@ -92,3 +94,60 @@ def show_error(msg: str) -> None:
 
 def ask_path(prompt: str) -> str:
     return web_input(prompt, type="text", required=True)
+
+
+# -------------------------- 实时进度输出 helper --------------------------
+
+def _html_escape(s: Any) -> str:
+    if s is None:
+        return ""
+    text = str(s)
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def begin_progress_section(title: str = "执行进度") -> None:
+    """在网页中新建一块"实时进度"区域，后续进度都追加到这里末尾。
+
+    区域为固定高度的可滚动容器，内容更新时自动滚动到底部（keep_bottom=True）。
+    """
+    put_markdown(f"## {title}")
+    # 外层 scope：重入调用时整体清空
+    with use_scope(_PROGRESS_SCOPE, clear=True):
+        # 固定高度 + keep_bottom 自动滚到底部；内部再包一个 scope 用于追加行
+        with put_scrollable(height=420, keep_bottom=True):
+            # 先创建/清空内部 scope 作为行容器
+            with use_scope(_PROGRESS_INNER_SCOPE, clear=True):
+                pass
+
+
+def progress_start(item: str, note: str = "") -> None:
+    """标记一个条目开始执行（灰色 ⏱ 行）。"""
+    safe_item = _html_escape(item)
+    safe_note = _html_escape(note)
+    suffix = f" <span style='color:#999;'>— {safe_note}</span>" if safe_note else ""
+    with use_scope(_PROGRESS_INNER_SCOPE):
+        put_html(
+            f"<div style='padding:3px 2px;color:#6b7280;font-size:14px;"
+            f"line-height:1.7;'>"
+            f"⏱ 开始 <b style='color:#374151;'>{safe_item}</b>{suffix}</div>"
+        )
+
+
+def progress_done(item: str, ok: bool, detail: str = "") -> None:
+    """标记一个条目结束：ok=True 绿色 ✅，ok=False 红色 ❌。"""
+    safe_item = _html_escape(item)
+    safe_detail = _html_escape(detail)
+    if ok:
+        color, emoji = "#16a34a", "✅"
+    else:
+        color, emoji = "#dc2626", "❌"
+    suffix = (f" <span style='color:#4b5563;font-weight:normal;'>"
+              f"— {safe_detail}</span>") if safe_detail else ""
+    with use_scope(_PROGRESS_INNER_SCOPE):
+        put_html(
+            f"<div style='padding:3px 2px;color:{color};font-size:14px;"
+            f"line-height:1.7;font-weight:600;'>"
+            f"{emoji} <span style='color:#111827;'>{safe_item}</span>"
+            f": 完成{suffix}</div>"
+        )

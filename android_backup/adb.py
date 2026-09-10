@@ -112,7 +112,7 @@ def has_root_access() -> bool:
     out = proc.stdout.strip()
     if out == "0":
         return True
-    # 兜底：直接尝试访问 /data/misc（这是 WiFi 备份用到的目录）
+    # 兜底：直接尝试读取 /data/misc 这类需 root 的系统私有目录
     probe = run_adb(
         ["shell", "ls /data/misc >/dev/null 2>&1 && echo YES || echo NO"],
         check=False, capture=True,
@@ -167,3 +167,41 @@ def push(local: Path, remote: str) -> None:
         raise AdbError(f"待推送文件不存在: {local}")
     run_adb(["push", str(local), remote], check=True)
     logger.info("已推送 %s -> %s (%d bytes)", local, remote, local.stat().st_size)
+
+
+def getprop(name: str) -> str:
+    """通过 `adb shell getprop <name>` 读取 Android 属性；失败返回空串。"""
+    proc = run_adb(["shell", f"getprop {name}"], check=False, capture=True)
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def pull_dir(remote_dir: str, local_dir: Path,
+             preserve_timestamp: bool = True) -> None:
+    """拉取整个远端目录到本地。
+
+    默认使用 `adb pull -a` 保留文件时间戳。若 adb 版本不支持 `-a`，
+    自动退化为无参 pull，并在 logger 中写 warning。
+    """
+    local_dir.parent.mkdir(parents=True, exist_ok=True)
+    args = ["pull"]
+    if preserve_timestamp:
+        # 先尝试带 -a
+        proc = run_adb([*args, "-a", remote_dir, str(local_dir)],
+                       check=False, capture=True)
+        stderr = (proc.stderr or "") + (proc.stdout or "")
+        if proc.returncode == 0:
+            logger.info("已拉取目录 (-a) %s -> %s", remote_dir, local_dir)
+            return
+        if "unknown option" in stderr.lower() or "invalid option" in stderr.lower():
+            logger.warning("adb pull -a 不被当前版本支持，退化为无 -a 拉取")
+        else:
+            # 不是 -a 兼容性问题：真正错误
+            raise AdbError(
+                f"adb pull 目录失败: {remote_dir} (exit={proc.returncode})\n"
+                f"{proc.stderr.strip()}"
+            )
+    # 无 -a 路径
+    run_adb(["pull", remote_dir, str(local_dir)], check=True)
+    logger.info("已拉取目录 %s -> %s", remote_dir, local_dir)

@@ -335,11 +335,27 @@ def backup(dest_dir: Path) -> None:
     apps_root.mkdir(parents=True, exist_ok=True)
     entries: List[Dict] = []
     for pkg in selected:
+        label = _get_app_label(pkg)
+        display = f"{label} ({pkg})" if label else pkg
+        ui.progress_start(f"备份应用 {display}")
         try:
-            entries.append(backup_one_package(pkg, dest_dir))
+            entry = backup_one_package(pkg, dest_dir)
+            entries.append(entry)
+            parts = []
+            if entry.get("has_apk"):
+                parts.append("APK✓")
+            if entry.get("has_data"):
+                parts.append("data✓")
+            if entry.get("has_ext_data"):
+                parts.append("ext✓")
+            if entry.get("has_obb"):
+                parts.append("obb✓")
+            detail = " ".join(parts) or "(无内容)"
+            ui.progress_done(f"备份应用 {display}", True, detail)
         except Exception as exc:  # noqa: BLE001
             logger.exception("备份应用失败 %s", pkg)
             entries.append({"pkg": pkg, "error": str(exc)})
+            ui.progress_done(f"备份应用 {display}", False, str(exc))
 
     (apps_root / "manifest.json").write_text(
         json.dumps({"created_at": _dt.datetime.now().isoformat(timespec="seconds"),
@@ -550,6 +566,13 @@ def restore(src_dir: Path) -> None:
     success, failed = 0, 0
     for pkg in selected:
         entry = by_pkg[pkg]
+        label = entry.get("label")
+        ver = entry.get("version_name")
+        if label:
+            display = f"{label} ({pkg}, v{ver})"
+        else:
+            display = f"{pkg} (v{ver})"
+        ui.progress_start(f"恢复应用 {display}")
         try:
             ok, msg = restore_one_package(entry, src_dir)
         except Exception as exc:  # noqa: BLE001
@@ -558,8 +581,10 @@ def restore(src_dir: Path) -> None:
         if ok:
             success += 1
             logger.info("✅ %s: %s", pkg, msg)
+            ui.progress_done(f"恢复应用 {display}", True, msg)
         else:
             failed += 1
             logger.error("❌ %s: %s", pkg, msg)
+            ui.progress_done(f"恢复应用 {display}", False, msg)
 
     logger.info("apps 恢复完成: 成功 %d, 失败 %d", success, failed)

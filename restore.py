@@ -5,7 +5,8 @@
     python restore.py <备份目录>
 
 若未提供备份目录，将在 PyWebIO 页面要求用户输入。
-若目标设备未 root，会在页面给出警告，并自动禁用需要 root 的恢复项。
+若目标设备未 root，会在页面给出警告，并自动禁用需要 root 的恢复项
+（应用、联系人、短信）；相册恢复仍可正常使用。
 """
 
 from __future__ import annotations
@@ -21,14 +22,21 @@ from typing import Any, Dict, List, Optional
 from pywebio import start_server
 from pywebio.output import put_markdown, put_text
 
-from android_backup import adb, apps, ui, wifi
+from android_backup import adb, apps, contacts, photos, sms, ui
 
 # 每个备份项是否需要 root 才能恢复
 ITEM_REQUIRES_ROOT: Dict[str, bool] = {
-    wifi.ITEM["id"]: True,
-    apps.ITEM["id"]: True,
+    photos.ITEM["id"]:   False,
+    contacts.ITEM["id"]: True,
+    sms.ITEM["id"]:      True,
+    apps.ITEM["id"]:     True,
 }
-BACKEND_BY_ID = {wifi.ITEM["id"]: wifi, apps.ITEM["id"]: apps}
+BACKEND_BY_ID = {
+    photos.ITEM["id"]:   photos,
+    contacts.ITEM["id"]: contacts,
+    sms.ITEM["id"]:      sms,
+    apps.ITEM["id"]:     apps,
+}
 
 logger = logging.getLogger("android_backup.restore")
 
@@ -58,7 +66,8 @@ def _make_app(initial_dir: Optional[str]):
 
 def _run(initial_dir: Optional[str]) -> None:
     put_markdown("# Android 恢复工具")
-    put_markdown("> 启动后会自动检查设备连接并尝试 `adb root`；若设备未 root，部分功能将被禁用。")
+    put_markdown("> 启动后会自动检查设备连接并尝试 `adb root`；若设备未 root，"
+                 "应用/联系人/短信 等需要 root 的项将被禁用，相册恢复仍可用。")
 
     # 1) 获取备份目录
     backup_dir_str = initial_dir or ui.ask_path("请输入备份目录路径")
@@ -98,9 +107,9 @@ def _run(initial_dir: Optional[str]) -> None:
     else:
         logger.warning("adb shell 不具备 root 权限，将禁用需要 root 的恢复项")
         ui.show_warning(
-            "未检测到 root 权限：应用数据恢复、WiFi 配置恢复均需要写入设备内部私有目录"
-            "（/data/data、/data/misc 等），已自动禁用上述恢复项。请先对设备进行 root"
-            " 解锁后再使用完整功能。"
+            "未检测到 root 权限：应用、联系人、短信的恢复需要写入系统私有目录"
+            "（/data/data 等），已自动禁用上述恢复项。相册恢复仍可勾选使用。"
+            "请先对设备进行 root 解锁后再使用完整功能。"
         )
 
     # 4) 构造勾选列表：需要 root 但无权限的项标记为 disabled
@@ -132,21 +141,28 @@ def _run(initial_dir: Optional[str]) -> None:
             ui.show_error("未选择任何恢复项（可能是未 root 导致所有项被禁用），已取消")
         return
 
-    # 6) 执行恢复
+    # 6) 执行恢复 —— 接入实时进度框架，每项开始/结束都在网页上追加输出
+    ui.begin_progress_section("恢复执行进度")
     rows = []
     for item_id in selected:
         item = next(it for it in supported if it["id"] == item_id)
         backend = BACKEND_BY_ID[item_id]
+        label = item.get("label") or item_id
+        ui.progress_start(label)
         try:
-            backend.restore(backup_dir)
-            rows.append([item.get("label") or item_id, "✅ 成功", "完成"])
+            result = backend.restore(backup_dir)
+            if result is False:
+                rows.append([label, "⏭️ 已跳过", "未选择可恢复内容"])
+                ui.progress_done(label, True, "已跳过")
+                continue
+            rows.append([label, "✅ 成功", "完成"])
+            ui.progress_done(label, True, "完成")
         except Exception as exc:  # noqa: BLE001
             logger.exception("恢复 %s 失败", item_id)
-            rows.append([item.get("label") or item_id, "❌ 失败", str(exc)])
+            rows.append([label, "❌ 失败", str(exc)])
+            ui.progress_done(label, False, str(exc))
 
     ui.show_result("恢复结果", rows)
-    if any(it == "wifi" for it in selected):
-        put_markdown("> 提示：已通过 tar 解包覆盖 WiFi 应用数据目录，并重启 WiFi 子系统。如未自动连接，可手动重启 WiFi 或重启设备。")
     put_markdown("---\n_完成后服务将自动退出，可关闭此页面。_")
 
 
